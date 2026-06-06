@@ -29,6 +29,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
@@ -104,45 +106,121 @@ def load_wb():
 
 
 # ──────────────────────────── ОТЧЁТЫ ────────────────────────────
-def report_summary() -> str:
+SKIP_CATS = {"Арматура тоннаж"}  # это объём (тонны), не деньги
+
+
+def _num(v):
+    """Число или None (отсекаем текст, ошибки вроде #DIV/0!)."""
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def _read_summary_data():
+    """Читает лист «Итого Месяцев»: список месяцев, суммы и доллары по категориям.
+
+    Возвращает (months, sums, usd):
+      months — список названий месяцев
+      sums   — {категория: [значения по месяцам в сумах]}
+      usd    — {категория: [значения по месяцам в долларах]}
+    """
     wb = load_wb()
     if wb is None:
-        return "⚠️ Файл таблицы не найден. Обновите его через «🔄 Обновить таблицу»."
+        return None
     ws = wb["Итого Месяцев"]
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
 
-    months = [c for c in rows[1][1:] if c]  # шапка месяцев
-    n_months = len(months)
+    months = [c for c in rows[1][1:] if c]
+    n = len(months)
 
-    # На листе два блока с одинаковыми категориями: «СУММЫ» и «ТОННАЖИ».
-    # Берём только первый (деньги) — от шапки до строки «Итого».
-    # «Арматура тоннаж» — это объём, не деньги, его пропускаем.
-    skip = {"Арматура тоннаж"}
-    totals = {}
-    grand_total = 0.0
-    for row in rows[2:]:
-        cat = row[0]
-        if cat is None or str(cat).strip() == "":
-            continue
-        if str(cat).strip().lower() == "итого":
-            break  # конец денежного блока
-        if cat in skip:
-            continue
-        s = sum(float(v) for v in row[1:1 + n_months]
-                if isinstance(v, (int, float)))
-        totals[cat] = s
-        grand_total += s
+    def parse_block(start_idx):
+        """Читает категории от строки start_idx до строки «Итого»."""
+        data = {}
+        for row in rows[start_idx:]:
+            cat = row[0]
+            if cat is None or str(cat).strip() == "":
+                continue
+            if str(cat).strip().lower() == "итого":
+                break
+            if cat in SKIP_CATS:
+                continue
+            data[cat] = [_num(v) for v in row[1:1 + n]]
+        return data
 
-    lines = ["📊 *СВОДКА ПО МЕСЯЦАМ* (сум)", ""]
-    lines.append(f"Период: {months[0]} — {months[-1]}")
+    # Блок сумов начинается со строки 2 (индекс 2 = третья строка листа).
+    sums = parse_block(2)
+    # Блок долларов — второй такой же блок ниже. Ищем вторую шапку «Категория».
+    usd = {}
+    for i, row in enumerate(rows):
+        if i > 1 and row and str(row[0]).strip() == "Категория":
+            usd = parse_block(i + 1)
+            break
+
+    return months, sums, usd
+
+
+def get_month_list():
+    """Список месяцев для кнопок (только те, где есть хоть какие-то расходы)."""
+    data = _read_summary_data()
+    if not data:
+        return []
+    months, sums, _ = data
+    active = []
+    for idx, m in enumerate(months):
+        total = 0.0
+        for vals in sums.values():
+            v = vals[idx] if idx < len(vals) else None
+            if v is not None:
+                total += v
+        if total:
+            active.append((idx, m))
+    return active
+
+
+def report_summary(month_idx=None) -> str:
+    """Сводка. month_idx=None — весь период; иначе конкретный месяц."""
+    data = _read_summary_data()
+    if not data:
+        return "⚠️ Файл таблицы не найден. Обновите его через «🔄 Обновить таблицу»."
+    months, sums, usd = data
+
+    def agg(store, idx):
+        """Сумма по категории: за месяц idx или за весь период (idx=None)."""
+        out = {}
+        for cat, vals in store.items():
+            if idx is None:
+                s = sum(v for v in vals if v is not None)
+            else:
+                s = vals[idx] if idx < len(vals) and vals[idx] is not None else 0
+            out[cat] = s
+        return out
+
+    sum_tot = agg(sums, month_idx)
+    usd_tot = agg(usd, month_idx)
+    grand_sum = sum(sum_tot.values())
+    grand_usd = sum(usd_tot.values())
+
+    if month_idx is None:
+        header = f"📊 *СВОДКА — ВЕСЬ ПЕРИОД*\n{months[0]} — {months[-1]}"
+    else:
+        header = f"📊 *СВОДКА — {months[month_idx]}*"
+
+    lines = [header, ""]
+    lines.append("*Расходы по категориям:*")
+    for cat, s in sorted(sum_tot.items(), key=lambda x: -x[1]):
+        if s == 0:
+            continue
+        share = (s / grand_sum * 100) if grand_sum else 0
+        d = usd_tot.get(cat, 0)
+        d_str = f" / ${fmt_num(d)}" if d else ""
+        lines.append(f"• {cat}: {fmt_num(s)} сум{d_str}  ({share:.1f}%)")
+
+    if grand_sum == 0:
+        lines.append("_За этот месяц расходов нет._")
+
     lines.append("")
-    lines.append("*Расходы по категориям (итого):*")
-    for cat, s in sorted(totals.items(), key=lambda x: -x[1]):
-        share = (s / grand_total * 100) if grand_total else 0
-        lines.append(f"• {cat}: {fmt_num(s)}  ({share:.1f}%)")
-    lines.append("")
-    lines.append(f"*ИТОГО: {fmt_num(grand_total)} сум*")
+    lines.append(f"*ИТОГО: {fmt_num(grand_sum)} сум*")
+    if grand_usd:
+        lines.append(f"*≈ ${fmt_num(grand_usd)}*")
     return "\n".join(lines)
 
 
@@ -237,11 +315,43 @@ async def start_handler(message: types.Message, state: FSMContext):
     )
 
 
+def summary_months_kb() -> InlineKeyboardMarkup:
+    """Кнопки выбора месяца + «Весь период»."""
+    rows = []
+    months = get_month_list()
+    row = []
+    for idx, name in months:
+        row.append(InlineKeyboardButton(text=name, callback_data=f"sum:{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="📈 Весь период (итого)",
+                                      callback_data="sum:all")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(F.text == "📊 Сводка")
 async def h_summary(message: types.Message):
     if not allowed(message.from_user.id):
         return
-    await message.answer(report_summary(), parse_mode="Markdown")
+    kb = summary_months_kb()
+    if not kb.inline_keyboard or len(kb.inline_keyboard) == 1:
+        await message.answer(report_summary(), parse_mode="Markdown")
+        return
+    await message.answer("Выберите месяц или весь период:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("sum:"))
+async def cb_summary(callback: types.CallbackQuery):
+    if not allowed(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 1)[1]
+    idx = None if key == "all" else int(key)
+    await callback.message.answer(report_summary(idx), parse_mode="Markdown")
+    await callback.answer()
 
 
 @dp.message(F.text == "💵 Курс USD")
