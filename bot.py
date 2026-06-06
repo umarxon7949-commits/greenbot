@@ -259,18 +259,57 @@ def report_stock() -> str:
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
 
+    # Находим строку заголовков (где первая ячейка — «Диаметр (D)»).
+    head_idx = None
+    for i, row in enumerate(rows):
+        if row and str(row[0]).strip().startswith("Диаметр"):
+            head_idx = i
+            break
+    if head_idx is None:
+        return "Данные об остатке не найдены."
+
+    headers = rows[head_idx]
+    # Названия колонок (берём как есть из файла).
+    col1 = str(headers[1]).strip() if len(headers) > 1 and headers[1] else "Приход"
+    col2 = str(headers[2]).strip() if len(headers) > 2 and headers[2] else None
+    col3 = str(headers[3]).strip() if len(headers) > 3 and headers[3] else None
+
+    # Решаем, тонны это или штуки: если значения дробные и небольшие — тонны.
+    sample = []
+    for row in rows[head_idx + 1:]:
+        if row and isinstance(row[1], (int, float)):
+            sample.append(row[1])
+    is_tonnes = bool(sample) and all(v < 100000 for v in sample) and \
+        any(v != int(v) for v in sample)
+    unit = " т" if is_tonnes else ""
+
+    def f(v):
+        if not isinstance(v, (int, float)):
+            return "—"
+        return f"{fmt_num(v)}{unit}"
+
     lines = ["📦 *ОСТАТОК АРМАТУРЫ*", ""]
-    started = False
-    for row in rows:
-        if row[0] == "Диаметр (D)":
-            started = True
+    total_row = None
+    for row in rows[head_idx + 1:]:
+        if not row or row[0] in (None, ""):
             continue
-        if started and row[0] is not None:
-            d, qty = row[0], row[1]
-            if d in (None, "") or str(d).strip().lower() in ("итого", "всего"):
-                continue
-            lines.append(f"• Ø {d}: {fmt_num(qty)} шт")
-    if len(lines) == 2:
+        d = str(row[0]).strip()
+        if d.lower() in ("итого", "всего"):
+            total_row = row
+            continue
+        parts = [f"• Ø {d}: {f(row[1])}"]
+        # вторую/третью колонку добавляем, только если в них есть ненулевое значение
+        if col2 and isinstance(row[2], (int, float)) and row[2]:
+            parts.append(f"{col2}: {f(row[2])}")
+        if col3 and isinstance(row[3], (int, float)) and row[3]:
+            parts.append(f"{col3}: {f(row[3])}")
+        lines.append("  |  ".join(parts))
+
+    if total_row is not None:
+        lines.append("")
+        lines.append(f"*ИТОГО: {f(total_row[1])}*")
+
+    if len(lines) <= 2:
         return "Данные об остатке не найдены."
     return "\n".join(lines)
 
