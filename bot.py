@@ -19,6 +19,7 @@ Telegram-бот для отчётов по таблице GREEN TASHKENT (тол
 """
 
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta
 
@@ -33,6 +34,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 
 # ──────────────────────────── НАСТРОЙКИ ────────────────────────────
@@ -63,6 +65,19 @@ ALLOWED_USERS: list[int] = (
     if _allowed_env else []
 )
 
+# Ссылка на файл в облаке (OneDrive/Google Drive и т.п.) для автообновления.
+# Задаётся переменной окружения EXCEL_URL. Если пусто — автообновление выключено.
+EXCEL_URL = os.getenv("EXCEL_URL", "").strip()
+
+# Час ежедневного автообновления (по часовому поясу сервера, UTC).
+# Ташкент = UTC+5, поэтому 2 UTC ≈ 7:00 утра в Ташкенте.
+SYNC_HOUR_UTC = int(os.getenv("SYNC_HOUR_UTC", "2"))
+
+# Публичный адрес мини-аппа (Railway domain). Если задан — в боте появляется
+# кнопка «Открыть панель». Railway передаёт порт через переменную PORT.
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
+PORT = int(os.getenv("PORT", "8080"))
+
 # ──────────────────────────── БОТ ────────────────────────────
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -78,15 +93,18 @@ def allowed(user_id: int) -> bool:
 
 
 def main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Сводка"), KeyboardButton(text="💵 Курс USD")],
-            [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="🏗 Приход арматуры")],
-            [KeyboardButton(text="📞 Контакты")],
-            [KeyboardButton(text="🔄 Обновить таблицу")],
-        ],
-        resize_keyboard=True,
-    )
+    rows = [
+        [KeyboardButton(text="📊 Сводка"), KeyboardButton(text="💵 Курс USD")],
+        [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="🏗 Приход арматуры")],
+        [KeyboardButton(text="📞 Контакты")],
+        [KeyboardButton(text="🔄 Обновить таблицу")],
+    ]
+    # Если задан публичный адрес — добавляем кнопку открытия мини-аппа.
+    if WEBAPP_URL:
+        rows.insert(0, [KeyboardButton(
+            text="📈 Открыть панель",
+            web_app=WebAppInfo(url=WEBAPP_URL))])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def fmt_num(value) -> str:
@@ -405,6 +423,62 @@ def report_intake(month_key=None) -> str:
     return "\n".join(lines)
 
 
+def build_app_data() -> dict:
+    """Собирает все данные для мини-аппа в один словарь (как для веб-страницы)."""
+    out = {"months": [], "sums": {}, "usd": {}, "intake": {}, "stock": [],
+           "rate": None, "rate_date": None}
+
+    data = _read_summary_data()
+    if data:
+        months, sums, usd = data
+        out["months"] = months
+        out["sums"] = sums
+        out["usd"] = usd
+
+    # приход по диаметрам
+    intake = _intake_by_diameter()
+    if intake:
+        out["intake"] = {f"{y}-{m:02d}": {k: round(v, 2) for k, v in b.items()}
+                         for (y, m), b in intake.items()}
+
+    # остаток (приход − использовано)
+    wb = load_wb()
+    if wb and "Остаток" in wb.sheetnames:
+        ws = wb["Остаток"]
+        rows = list(ws.iter_rows(values_only=True))
+        head_idx = None
+        for i, row in enumerate(rows):
+            if row and str(row[0]).strip().startswith("Диаметр"):
+                head_idx = i
+                break
+        if head_idx is not None:
+            for row in rows[head_idx + 1:]:
+                if not row or row[0] in (None, ""):
+                    continue
+                d = str(row[0]).strip()
+                if d.lower() in ("итого", "всего"):
+                    continue
+                pr = row[1] if isinstance(row[1], (int, float)) else 0
+                isp = row[3] if len(row) > 3 and isinstance(row[3], (int, float)) else 0
+                out["stock"].append({"d": d, "ost": pr - isp})
+    if wb:
+        wb.close()
+
+    # курс
+    wb = load_wb()
+    if wb and "Курс валют" in wb.sheetnames:
+        ws = wb["Курс валют"]
+        last = None
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0] is not None and len(row) > 3 and row[3] is not None:
+                last = row
+        if last:
+            out["rate"] = _num(last[3])
+        wb.close()
+
+    return out
+
+
 def search_contacts(query: str) -> str:
     wb = load_wb()
     if wb is None:
@@ -583,9 +657,126 @@ async def fallback(message: types.Message):
     await message.answer("Выберите раздел в меню 👇", reply_markup=main_kb())
 
 
+# ──────────────────────────── АВТООБНОВЛЕНИЕ ИЗ ОБЛАКА ────────────────────────────
+import urllib.request
+import base64
+
+
+def _to_direct_url(url: str) -> str:
+    """Превращает ссылку OneDrive/Google Drive в прямую загрузку файла."""
+    u = url.strip()
+    # OneDrive личный (1drv.ms / onedrive.live.com) → base64-приём для прямой загрузки
+    if "1drv.ms" in u or "onedrive.live.com" in u:
+        b64 = base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+        return f"https://api.onedrive.com/v1.0/shares/u!{b64}/root/content"
+    # SharePoint / OneDrive for Business: добавляем download=1
+    if "sharepoint.com" in u or "-my.sharepoint" in u:
+        sep = "&" if "?" in u else "?"
+        return u + sep + "download=1"
+    # Google Drive: /file/d/<ID>/view → uc?export=download&id=<ID>
+    if "drive.google.com" in u and "/d/" in u:
+        try:
+            fid = u.split("/d/")[1].split("/")[0]
+            return f"https://drive.google.com/uc?export=download&id={fid}"
+        except IndexError:
+            return u
+    return u
+
+
+def sync_from_url() -> tuple[bool, str]:
+    """Скачивает файл по EXCEL_URL и сохраняет в EXCEL_FILE. (успех, сообщение)."""
+    if not EXCEL_URL:
+        return False, "Ссылка для автообновления не задана (переменная EXCEL_URL)."
+    direct = _to_direct_url(EXCEL_URL)
+    try:
+        req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+        # Проверяем, что это xlsx (zip-архив начинается с 'PK').
+        if data[:2] != b"PK":
+            return False, ("Скачан не Excel-файл. Проверьте, что ссылка ведёт "
+                           "на сам файл и открыта для всех по ссылке.")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(EXCEL_FILE, "wb") as f:
+            f.write(data)
+        return True, f"Таблица обновлена из облака ({len(data) // 1024} КБ)."
+    except Exception as e:
+        return False, f"Не удалось скачать: {e}"
+
+
+async def daily_sync_loop():
+    """Раз в сутки в SYNC_HOUR_UTC скачивает свежий файл из облака."""
+    if not EXCEL_URL:
+        return
+    while True:
+        now = datetime.utcnow()
+        target = now.replace(hour=SYNC_HOUR_UTC, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        ok, msg = sync_from_url()
+        print(f"[автообновление] {msg}")
+
+
+@dp.message(Command("sync"))
+async def h_sync(message: types.Message):
+    """Ручной запуск обновления из облака — проверить, что ссылка работает."""
+    if not allowed(message.from_user.id):
+        return
+    await message.answer("⏳ Скачиваю файл из облака…")
+    ok, msg = sync_from_url()
+    await message.answer(("✅ " if ok else "❌ ") + msg, reply_markup=main_kb())
+
+
+# ──────────────────────────── ВЕБ-СЕРВЕР (МИНИ-АПП) ────────────────────────────
+from aiohttp import web
+
+# Папка, где лежит miniapp.html (рядом с bot.py).
+_APP_DIR = os.path.dirname(__file__)
+
+
+async def web_index(request):
+    path = os.path.join(_APP_DIR, "miniapp.html")
+    if not os.path.exists(path):
+        return web.Response(text="miniapp.html не найден", status=404)
+    return web.FileResponse(path)
+
+
+async def web_data(request):
+    """Отдаёт данные таблицы в JSON для мини-аппа."""
+    try:
+        data = build_app_data()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response(data, headers={"Cache-Control": "no-store"})
+
+
+async def web_health(request):
+    return web.Response(text="ok")
+
+
+def make_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", web_index)
+    app.router.add_get("/api/data", web_data)
+    app.router.add_get("/health", web_health)
+    return app
+
+
 # ──────────────────────────── ЗАПУСК ────────────────────────────
 async def main():
     print("Бот запущен.")
+    if EXCEL_URL:
+        asyncio.create_task(daily_sync_loop())
+        print(f"Автообновление включено: каждый день в {SYNC_HOUR_UTC}:00 UTC.")
+
+    # Поднимаем веб-сервер (для мини-аппа) параллельно с ботом.
+    runner = web.AppRunner(make_web_app())
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Веб-сервер мини-аппа слушает порт {PORT}.")
+
     await dp.start_polling(bot)
 
 
