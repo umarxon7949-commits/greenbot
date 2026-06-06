@@ -81,7 +81,8 @@ def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Сводка"), KeyboardButton(text="💵 Курс USD")],
-            [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="📞 Контакты")],
+            [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="🏗 Приход арматуры")],
+            [KeyboardButton(text="📞 Контакты")],
             [KeyboardButton(text="🔄 Обновить таблицу")],
         ],
         resize_keyboard=True,
@@ -269,48 +270,138 @@ def report_stock() -> str:
         return "Данные об остатке не найдены."
 
     headers = rows[head_idx]
-    # Названия колонок (берём как есть из файла).
-    col1 = str(headers[1]).strip() if len(headers) > 1 and headers[1] else "Приход"
-    col2 = str(headers[2]).strip() if len(headers) > 2 and headers[2] else None
-    col3 = str(headers[3]).strip() if len(headers) > 3 and headers[3] else None
-
-    # Решаем, тонны это или штуки: если значения дробные и небольшие — тонны.
+    # Колонки: 1 = приход (итог приход), 3 = использовано (итого использован).
+    # Остаток считаем как Приход − Использовано.
+    # Определяем единицу: тонны, если значения дробные и небольшие.
     sample = []
     for row in rows[head_idx + 1:]:
         if row and isinstance(row[1], (int, float)):
             sample.append(row[1])
     is_tonnes = bool(sample) and all(v < 100000 for v in sample) and \
         any(v != int(v) for v in sample)
-    unit = " т" if is_tonnes else ""
+    unit = " т" if is_tonnes else " шт"
 
     def f(v):
-        if not isinstance(v, (int, float)):
-            return "—"
         return f"{fmt_num(v)}{unit}"
 
-    lines = ["📦 *ОСТАТОК АРМАТУРЫ*", ""]
-    total_row = None
+    lines = ["📦 *ОСТАТОК АРМАТУРЫ*", "_(приход − использовано)_", ""]
+    grand = 0.0
+    any_row = False
     for row in rows[head_idx + 1:]:
         if not row or row[0] in (None, ""):
             continue
         d = str(row[0]).strip()
         if d.lower() in ("итого", "всего"):
-            total_row = row
             continue
-        parts = [f"• Ø {d}: {f(row[1])}"]
-        # вторую/третью колонку добавляем, только если в них есть ненулевое значение
-        if col2 and isinstance(row[2], (int, float)) and row[2]:
-            parts.append(f"{col2}: {f(row[2])}")
-        if col3 and isinstance(row[3], (int, float)) and row[3]:
-            parts.append(f"{col3}: {f(row[3])}")
-        lines.append("  |  ".join(parts))
+        prihod = row[1] if isinstance(row[1], (int, float)) else 0
+        ispol = row[3] if len(row) > 3 and isinstance(row[3], (int, float)) else 0
+        ostatok = prihod - ispol
+        grand += ostatok
+        any_row = True
+        lines.append(f"• Ø {d}: {f(ostatok)}")
 
-    if total_row is not None:
-        lines.append("")
-        lines.append(f"*ИТОГО: {f(total_row[1])}*")
-
-    if len(lines) <= 2:
+    if not any_row:
         return "Данные об остатке не найдены."
+    lines.append("")
+    lines.append(f"*ИТОГО остаток: {f(grand)}*")
+    return "\n".join(lines)
+
+
+def _intake_by_diameter():
+    """Читает лист «Арматура приход»: вес (кг) по диаметрам, сгруппированный по месяцам.
+
+    Возвращает dict: {(год, месяц): {диаметр: тонны}} или None.
+    """
+    from datetime import datetime as _dt
+    wb = load_wb()
+    if wb is None or "Арматура приход" not in wb.sheetnames:
+        return None
+    ws = wb["Арматура приход"]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+    if not rows:
+        return None
+
+    # Находим колонки диаметров по заголовкам (Катанка, D8, D10, ... D25).
+    header = rows[0]
+    diam_cols = {}
+    for idx, h in enumerate(header):
+        if h is None:
+            continue
+        name = str(h).strip()
+        if name == "Катанка" or (name.startswith("D") and name[1:].isdigit()):
+            diam_cols[idx] = name
+    if not diam_cols:
+        return None
+
+    result = {}
+    for row in rows[1:]:
+        d = row[1] if len(row) > 1 else None
+        if not isinstance(d, _dt):
+            continue
+        key = (d.year, d.month)
+        bucket = result.setdefault(key, {})
+        for c, name in diam_cols.items():
+            v = row[c] if c < len(row) else None
+            if isinstance(v, (int, float)) and v > 0:
+                # защита от аномалий: один прут не может весить > 50 т
+                if v > 50000:
+                    continue
+                bucket[name] = bucket.get(name, 0) + v / 1000.0  # кг → т
+    return result
+
+
+_MONTH_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
+    7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+
+
+def get_intake_months():
+    """Месяцы, где был приход арматуры (для кнопок)."""
+    data = _intake_by_diameter()
+    if not data:
+        return []
+    out = []
+    for (y, m) in sorted(data):
+        if sum(data[(y, m)].values()) > 0:
+            out.append((f"{y}-{m:02d}", f"{_MONTH_RU[m]} {y}"))
+    return out
+
+
+def report_intake(month_key=None) -> str:
+    """Приход арматуры. month_key=None — весь период по месяцам;
+    иначе строка 'ГГГГ-ММ' — разбивка по диаметрам за месяц."""
+    data = _intake_by_diameter()
+    if not data:
+        return "⚠️ Данные о приходе не найдены (лист «Арматура приход»)."
+
+    if month_key is None:
+        lines = ["🏗 *ПРИХОД АРМАТУРЫ — ВЕСЬ ПЕРИОД*", ""]
+        grand = 0.0
+        for (y, m) in sorted(data):
+            tot = sum(data[(y, m)].values())
+            if tot > 0:
+                grand += tot
+                lines.append(f"• {_MONTH_RU[m]} {y}: {fmt_num(round(tot, 2))} т")
+        lines.append("")
+        lines.append(f"*ИТОГО приход: {fmt_num(round(grand, 2))} т*")
+        return "\n".join(lines)
+
+    y, m = (int(x) for x in month_key.split("-"))
+    bucket = data.get((y, m), {})
+    if not bucket:
+        return f"🏗 *ПРИХОД — {_MONTH_RU[m]} {y}*\n\nЗа этот месяц прихода нет."
+
+    lines = [f"🏗 *ПРИХОД АРМАТУРЫ — {_MONTH_RU[m]} {y}*", ""]
+    lines.append("*По диаметрам:*")
+    # сортируем по убыванию тоннажа
+    for name, t in sorted(bucket.items(), key=lambda x: -x[1]):
+        label = name if name == "Катанка" else f"Ø {name[1:]}"
+        lines.append(f"• {label}: {fmt_num(round(t, 2))} т")
+    total = sum(bucket.values())
+    lines.append("")
+    lines.append(f"*ИТОГО за месяц: {fmt_num(round(total, 2))} т*")
     return "\n".join(lines)
 
 
@@ -405,6 +496,43 @@ async def h_stock(message: types.Message):
     if not allowed(message.from_user.id):
         return
     await message.answer(report_stock(), parse_mode="Markdown")
+
+
+def intake_months_kb() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for idx, name in get_intake_months():
+        row.append(InlineKeyboardButton(text=name, callback_data=f"in:{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="📈 Весь период (итого)",
+                                      callback_data="in:all")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "🏗 Приход арматуры")
+async def h_intake(message: types.Message):
+    if not allowed(message.from_user.id):
+        return
+    kb = intake_months_kb()
+    if len(kb.inline_keyboard) == 1:  # только кнопка «весь период»
+        await message.answer(report_intake(), parse_mode="Markdown")
+        return
+    await message.answer("Выберите месяц или весь период:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("in:"))
+async def cb_intake(callback: types.CallbackQuery):
+    if not allowed(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 1)[1]
+    month_key = None if key == "all" else key
+    await callback.message.answer(report_intake(month_key), parse_mode="Markdown")
+    await callback.answer()
 
 
 @dp.message(F.text == "📞 Контакты")
