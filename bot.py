@@ -859,10 +859,12 @@ _APP_DIR = os.path.dirname(__file__)
 
 
 async def web_index(request):
-    path = os.path.join(_APP_DIR, "miniapp.html")
-    if not os.path.exists(path):
-        return web.Response(text="miniapp.html не найден", status=404)
-    return web.FileResponse(path)
+    # Файл мини-аппа может называться index.html или miniapp.html.
+    for fname in ("index.html", "miniapp.html"):
+        path = os.path.join(_APP_DIR, fname)
+        if os.path.exists(path):
+            return web.FileResponse(path)
+    return web.Response(text="Файл мини-аппа не найден", status=404)
 
 
 async def web_data(request):
