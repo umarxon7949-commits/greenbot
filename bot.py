@@ -96,7 +96,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📊 Сводка"), KeyboardButton(text="💵 Курс USD")],
         [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="🏗 Приход арматуры")],
-        [KeyboardButton(text="📞 Контакты")],
+        [KeyboardButton(text="🧱 Бетон"), KeyboardButton(text="📞 Контакты")],
         [KeyboardButton(text="🔄 Обновить таблицу")],
     ]
     # Если задан публичный адрес — добавляем кнопку открытия мини-аппа.
@@ -423,6 +423,82 @@ def report_intake(month_key=None) -> str:
     return "\n".join(lines)
 
 
+def _concrete_by_month():
+    """Лист «Бетон»: по месяцам марка → [объём м³, сумма сум]."""
+    from datetime import datetime as _dt
+    wb = load_wb()
+    if wb is None or "Бетон" not in wb.sheetnames:
+        return None
+    ws = wb["Бетон"]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+    result = {}
+    for row in rows[1:]:
+        d = row[0] if row else None
+        if not isinstance(d, _dt):  # пропускаем строки «Итог»
+            continue
+        mark = row[3] if len(row) > 3 else None
+        qty = row[4] if len(row) > 4 else None
+        summ = row[5] if len(row) > 5 else None
+        if not mark or not isinstance(qty, (int, float)):
+            continue
+        key = (d.year, d.month)
+        bucket = result.setdefault(key, {})
+        m = str(mark).strip()
+        cur = bucket.setdefault(m, [0.0, 0.0])
+        cur[0] += qty
+        cur[1] += summ if isinstance(summ, (int, float)) else 0
+    return result
+
+
+def get_concrete_months():
+    """Месяцы с поставками бетона (для кнопок)."""
+    data = _concrete_by_month()
+    if not data:
+        return []
+    return [(f"{y}-{m:02d}", f"{_MONTH_RU[m]} {y}") for (y, m) in sorted(data)]
+
+
+def report_concrete(month_key=None) -> str:
+    """Бетон: за месяц (по маркам) или весь период."""
+    data = _concrete_by_month()
+    if not data:
+        return "⚠️ Данные по бетону не найдены (лист «Бетон»)."
+
+    if month_key is None:
+        lines = ["🧱 *БЕТОН — ВЕСЬ ПЕРИОД*", "", "*По маркам:*"]
+        marks = {}
+        grand_q = grand_s = 0.0
+        for (y, m), bucket in data.items():
+            for mark, (q, s) in bucket.items():
+                cur = marks.setdefault(mark, [0.0, 0.0])
+                cur[0] += q
+                cur[1] += s
+                grand_q += q
+                grand_s += s
+        for mark, (q, s) in sorted(marks.items(), key=lambda x: -x[1][0]):
+            lines.append(f"• {mark}: {fmt_num(round(q, 1))} м³  ({fmt_num(round(s))} сум)")
+        lines.append("")
+        lines.append(f"*ИТОГО: {fmt_num(round(grand_q, 1))} м³*")
+        lines.append(f"*Сумма: {fmt_num(round(grand_s))} сум*")
+        return "\n".join(lines)
+
+    y, m = (int(x) for x in month_key.split("-"))
+    bucket = data.get((y, m), {})
+    if not bucket:
+        return f"🧱 *БЕТОН — {_MONTH_RU[m]} {y}*\n\nЗа этот месяц поставок нет."
+    lines = [f"🧱 *БЕТОН — {_MONTH_RU[m]} {y}*", "", "*По маркам:*"]
+    tot_q = tot_s = 0.0
+    for mark, (q, s) in sorted(bucket.items(), key=lambda x: -x[1][0]):
+        lines.append(f"• {mark}: {fmt_num(round(q, 1))} м³  ({fmt_num(round(s))} сум)")
+        tot_q += q
+        tot_s += s
+    lines.append("")
+    lines.append(f"*ИТОГО за месяц: {fmt_num(round(tot_q, 1))} м³*")
+    lines.append(f"*Сумма: {fmt_num(round(tot_s))} сум*")
+    return "\n".join(lines)
+
+
 def build_app_data() -> dict:
     """Собирает все данные для мини-аппа в один словарь (как для веб-страницы)."""
     out = {"months": [], "sums": {}, "usd": {}, "intake": {}, "stock": [],
@@ -440,6 +516,16 @@ def build_app_data() -> dict:
     if intake:
         out["intake"] = {f"{y}-{m:02d}": {k: round(v, 2) for k, v in b.items()}
                          for (y, m), b in intake.items()}
+
+    # бетон по месяцам и маркам
+    concrete = _concrete_by_month()
+    if concrete:
+        out["concrete"] = {
+            f"{y}-{m:02d}": {mark: [round(q, 1), round(s)] for mark, (q, s) in b.items()}
+            for (y, m), b in concrete.items()
+        }
+    else:
+        out["concrete"] = {}
 
     # остаток (приход − использовано)
     wb = load_wb()
@@ -606,6 +692,43 @@ async def cb_intake(callback: types.CallbackQuery):
     key = callback.data.split(":", 1)[1]
     month_key = None if key == "all" else key
     await callback.message.answer(report_intake(month_key), parse_mode="Markdown")
+    await callback.answer()
+
+
+def concrete_months_kb() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for key, name in get_concrete_months():
+        row.append(InlineKeyboardButton(text=name, callback_data=f"bet:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="📈 Весь период (итого)",
+                                      callback_data="bet:all")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "🧱 Бетон")
+async def h_concrete(message: types.Message):
+    if not allowed(message.from_user.id):
+        return
+    kb = concrete_months_kb()
+    if len(kb.inline_keyboard) == 1:
+        await message.answer(report_concrete(), parse_mode="Markdown")
+        return
+    await message.answer("Выберите месяц или весь период:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("bet:"))
+async def cb_concrete(callback: types.CallbackQuery):
+    if not allowed(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 1)[1]
+    month_key = None if key == "all" else key
+    await callback.message.answer(report_concrete(month_key), parse_mode="Markdown")
     await callback.answer()
 
 
