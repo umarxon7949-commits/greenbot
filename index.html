@@ -301,7 +301,17 @@ document.querySelectorAll("nav button").forEach(b=>{
 
 async function init(){
   try{
-    const r = await fetch("api/data?t="+Date.now());
+    let initData = "";
+    try{ initData = Telegram.WebApp.initData || ""; }catch(e){}
+    const r = await fetch("api/data?t="+Date.now(), {
+      headers: { "X-Init-Data": initData }
+    });
+    if(r.status===403){
+      document.getElementById("content").innerHTML =
+        '<div class="card">⛔ Доступ ограничен. Эта панель доступна только сотрудникам.</div>';
+      document.getElementById("seg").innerHTML="";
+      return;
+    }
     DATA = await r.json();
   }catch(e){
     document.getElementById("content").innerHTML =

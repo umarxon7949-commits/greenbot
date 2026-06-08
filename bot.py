@@ -853,9 +853,36 @@ async def h_sync(message: types.Message):
 
 # ──────────────────────────── ВЕБ-СЕРВЕР (МИНИ-АПП) ────────────────────────────
 from aiohttp import web
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
 
 # Папка, где лежит miniapp.html (рядом с bot.py).
 _APP_DIR = os.path.dirname(__file__)
+
+
+def _check_webapp_user(init_data: str):
+    """Проверяет подпись Telegram WebApp initData и возвращает user_id или None.
+
+    Подпись подделать нельзя — она считается секретным ключом бота.
+    """
+    if not init_data:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        their_hash = pairs.pop("hash", None)
+        if not their_hash:
+            return None
+        # строка для проверки: все поля кроме hash, отсортированы, через \n
+        check = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if calc != their_hash:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        return user.get("id")
+    except Exception:
+        return None
 
 
 async def web_index(request):
@@ -868,7 +895,13 @@ async def web_index(request):
 
 
 async def web_data(request):
-    """Отдаёт данные таблицы в JSON для мини-аппа."""
+    """Отдаёт данные таблицы в JSON — только авторизованным пользователям."""
+    # Если список доступа задан — требуем валидный Telegram initData.
+    if ALLOWED_USERS:
+        init_data = request.headers.get("X-Init-Data", "")
+        uid = _check_webapp_user(init_data)
+        if uid is None or uid not in ALLOWED_USERS:
+            return web.json_response({"error": "Доступ ограничен"}, status=403)
     try:
         data = build_app_data()
     except Exception as e:
