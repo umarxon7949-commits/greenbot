@@ -35,6 +35,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     WebAppInfo,
+    FSInputFile,
 )
 
 # ──────────────────────────── НАСТРОЙКИ ────────────────────────────
@@ -78,6 +79,9 @@ SYNC_HOUR_UTC = int(os.getenv("SYNC_HOUR_UTC", "2"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
+# Час ежедневной утренней сводки (UTC). 2 UTC ≈ 7:00 Ташкент. Пусто = выключено.
+DIGEST_HOUR_UTC = os.getenv("DIGEST_HOUR_UTC", "").strip()
+
 # ──────────────────────────── БОТ ────────────────────────────
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -97,12 +101,13 @@ def main_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📊 Сводка"), KeyboardButton(text="💵 Курс USD")],
         [KeyboardButton(text="📦 Остаток"), KeyboardButton(text="🏗 Приход арматуры")],
         [KeyboardButton(text="🧱 Бетон"), KeyboardButton(text="📞 Контакты")],
+        [KeyboardButton(text="📈 Сравнить месяцы"), KeyboardButton(text="📥 Выгрузить отчёт")],
         [KeyboardButton(text="🔄 Обновить таблицу")],
     ]
     # Если задан публичный адрес — добавляем кнопку открытия мини-аппа.
     if WEBAPP_URL:
         rows.insert(0, [KeyboardButton(
-            text="📈 Открыть панель",
+            text="📊 Открыть панель",
             web_app=WebAppInfo(url=WEBAPP_URL))])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -590,6 +595,139 @@ def search_contacts(query: str) -> str:
     return "📞 *Найдено:*\n\n" + "\n\n".join(found[:15])
 
 
+def report_compare() -> str:
+    """Сравнивает последний месяц с предыдущим по категориям."""
+    data = _read_summary_data()
+    if not data:
+        return "⚠️ Файл таблицы не найден."
+    months, sums, _ = data
+    # находим два последних месяца с расходами
+    active = []
+    for idx, m in enumerate(months):
+        total = sum(v for vals in sums.values()
+                    for v in [vals[idx] if idx < len(vals) else None]
+                    if v is not None)
+        if total:
+            active.append(idx)
+    if len(active) < 2:
+        return "Недостаточно данных для сравнения (нужно минимум 2 месяца)."
+    cur, prev = active[-1], active[-2]
+
+    lines = [f"📈 *СРАВНЕНИЕ: {months[cur]} vs {months[prev]}*", ""]
+    cur_tot = prev_tot = 0.0
+    for cat in sums:
+        c = sums[cat][cur] if cur < len(sums[cat]) and sums[cat][cur] else 0
+        p = sums[cat][prev] if prev < len(sums[cat]) and sums[cat][prev] else 0
+        if not c and not p:
+            continue
+        cur_tot += c
+        prev_tot += p
+        if p == 0:
+            arrow, pct = "🆕", "новое"
+        else:
+            diff = (c - p) / p * 100
+            arrow = "🔺" if diff > 0 else "🔻" if diff < 0 else "➡️"
+            pct = f"{diff:+.0f}%"
+        lines.append(f"{arrow} {cat}: {fmt_num(c)} ({pct})")
+    lines.append("")
+    if prev_tot:
+        td = (cur_tot - prev_tot) / prev_tot * 100
+        lines.append(f"*Итого: {fmt_num(cur_tot)} сум ({td:+.0f}%)*")
+    else:
+        lines.append(f"*Итого: {fmt_num(cur_tot)} сум*")
+    return "\n".join(lines)
+
+
+def build_excel_report() -> str | None:
+    """Создаёт Excel-файл со сводкой по месяцам. Возвращает путь или None."""
+    data = _read_summary_data()
+    if not data:
+        return None
+    months, sums, usd = data
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сводка"
+
+    hdr_fill = PatternFill("solid", start_color="1F7A4D")
+    hdr_font = Font(bold=True, color="FFFFFF")
+    bold = Font(bold=True)
+
+    # шапка: Категория + месяцы (только активные) + Итого
+    active = [i for i, m in enumerate(months)
+              if any((sums[c][i] if i < len(sums[c]) else None) for c in sums)]
+    header = ["Категория"] + [months[i] for i in active] + ["Итого, сум"]
+    ws.append(header)
+    for col in range(1, len(header) + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for cat in sums:
+        row = [cat]
+        tot = 0.0
+        for i in active:
+            v = sums[cat][i] if i < len(sums[cat]) and sums[cat][i] else 0
+            row.append(v)
+            tot += v
+        row.append(tot)
+        ws.append(row)
+
+    # строка Итого
+    last = ws.max_row
+    total_row = ["ИТОГО"]
+    for col_i, i in enumerate(active, start=2):
+        letter = ws.cell(row=1, column=col_i).column_letter
+        total_row.append(f"=SUM({letter}2:{letter}{last})")
+    letter = ws.cell(row=1, column=len(active) + 2).column_letter
+    total_row.append(f"=SUM({letter}2:{letter}{last})")
+    ws.append(total_row)
+    for col in range(1, len(header) + 1):
+        ws.cell(row=ws.max_row, column=col).font = bold
+
+    # формат чисел и ширина
+    for r in range(2, ws.max_row + 1):
+        for c in range(2, len(header) + 1):
+            ws.cell(row=r, column=c).number_format = "#,##0"
+    ws.column_dimensions["A"].width = 22
+    for c in range(2, len(header) + 1):
+        ws.column_dimensions[ws.cell(row=1, column=c).column_letter].width = 16
+
+    out = os.path.join(DATA_DIR, f"Отчёт_{datetime.now():%Y%m%d}.xlsx")
+    wb.save(out)
+    return out
+
+
+def build_daily_digest() -> str:
+    """Короткая утренняя сводка: последний месяц + сравнение."""
+    data = _read_summary_data()
+    if not data:
+        return "⚠️ Нет данных для сводки."
+    months, sums, _ = data
+    active = [i for i, m in enumerate(months)
+              if any((sums[c][i] if i < len(sums[c]) else None) for c in sums)]
+    if not active:
+        return "Нет данных за период."
+    cur = active[-1]
+    cur_tot = sum((sums[c][cur] if cur < len(sums[c]) and sums[c][cur] else 0)
+                  for c in sums)
+    lines = [f"☀️ *Доброе утро! Сводка GREEN TASHKENT*",
+             f"_{datetime.now():%d.%m.%Y}_", "",
+             f"Текущий месяц: *{months[cur]}*",
+             f"Расходы: *{fmt_num(cur_tot)} сум*", ""]
+    # топ-3 категории
+    cats = sorted(sums.items(),
+                  key=lambda kv: -(kv[1][cur] if cur < len(kv[1]) and kv[1][cur] else 0))
+    lines.append("Топ категорий:")
+    for cat, vals in cats[:3]:
+        v = vals[cur] if cur < len(vals) and vals[cur] else 0
+        if v:
+            lines.append(f"• {cat}: {fmt_num(v)} сум")
+    return "\n".join(lines)
+
+
 # ──────────────────────────── ХЕНДЛЕРЫ ────────────────────────────
 @dp.message(Command("start"))
 @dp.message(Command("menu"))
@@ -732,6 +870,27 @@ async def cb_concrete(callback: types.CallbackQuery):
     await callback.answer()
 
 
+@dp.message(F.text == "📈 Сравнить месяцы")
+async def h_compare(message: types.Message):
+    if not allowed(message.from_user.id):
+        return
+    await message.answer(report_compare(), parse_mode="Markdown")
+
+
+@dp.message(F.text == "📥 Выгрузить отчёт")
+async def h_export(message: types.Message):
+    if not allowed(message.from_user.id):
+        return
+    await message.answer("⏳ Готовлю Excel-отчёт…")
+    path = build_excel_report()
+    if not path:
+        await message.answer("⚠️ Файл таблицы не найден.", reply_markup=main_kb())
+        return
+    await message.answer_document(FSInputFile(path),
+                                  caption="📊 Сводка по месяцам",
+                                  reply_markup=main_kb())
+
+
 @dp.message(F.text == "📞 Контакты")
 async def h_contacts(message: types.Message, state: FSMContext):
     if not allowed(message.from_user.id):
@@ -841,6 +1000,25 @@ async def daily_sync_loop():
         print(f"[автообновление] {msg}")
 
 
+async def daily_digest_loop():
+    """Раз в сутки в DIGEST_HOUR_UTC шлёт утреннюю сводку всем из ALLOWED_USERS."""
+    if not DIGEST_HOUR_UTC or not ALLOWED_USERS:
+        return
+    hour = int(DIGEST_HOUR_UTC)
+    while True:
+        now = datetime.utcnow()
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        text = build_daily_digest()
+        for uid in ALLOWED_USERS:
+            try:
+                await bot.send_message(uid, text, parse_mode="Markdown")
+            except Exception as e:
+                print(f"[сводка] не отправлено {uid}: {e}")
+
+
 @dp.message(Command("sync"))
 async def h_sync(message: types.Message):
     """Ручной запуск обновления из облака — проверить, что ссылка работает."""
@@ -927,6 +1105,9 @@ async def main():
     if EXCEL_URL:
         asyncio.create_task(daily_sync_loop())
         print(f"Автообновление включено: каждый день в {SYNC_HOUR_UTC}:00 UTC.")
+    if DIGEST_HOUR_UTC and ALLOWED_USERS:
+        asyncio.create_task(daily_digest_loop())
+        print(f"Утренняя сводка включена: каждый день в {DIGEST_HOUR_UTC}:00 UTC.")
 
     # Поднимаем веб-сервер (для мини-аппа) параллельно с ботом.
     runner = web.AppRunner(make_web_app())
