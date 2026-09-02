@@ -359,8 +359,8 @@ def _intake_by_diameter():
             date_col = idx
         if low.startswith("использов"):
             continue  # это не диаметр, а расход
-        if name == "Катанка" or name.startswith("Катанка"):
-            diam_cols[idx] = "Катанка"
+        if name.startswith("Катанка"):
+            diam_cols[idx] = name  # сохраняем как есть: «Катанка» и «Катанка 6,5» — разные
         elif name.startswith("D") and name[1:].strip().isdigit():
             diam_cols[idx] = "D" + name[1:].strip()
     if not diam_cols:
@@ -431,7 +431,7 @@ def report_intake(month_key=None) -> str:
     lines.append("*По диаметрам:*")
     # сортируем по убыванию тоннажа
     for name, t in sorted(bucket.items(), key=lambda x: -x[1]):
-        label = name if name == "Катанка" else f"Ø {name[1:]}"
+        label = f"Ø {name[1:]}" if name.startswith("D") else name
         lines.append(f"• {label}: {fmt_num(round(t, 2))} т")
     total = sum(bucket.values())
     lines.append("")
