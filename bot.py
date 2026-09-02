@@ -346,20 +346,31 @@ def _intake_by_diameter():
         return None
 
     # Находим колонки диаметров по заголовкам (Катанка, D8, D10, ... D25).
+    # Колонки «Использовано…» пропускаем.
     header = rows[0]
     diam_cols = {}
+    date_col = None
     for idx, h in enumerate(header):
         if h is None:
             continue
         name = str(h).strip()
-        if name == "Катанка" or (name.startswith("D") and name[1:].isdigit()):
-            diam_cols[idx] = name
+        low = name.lower()
+        if "дата" in low and date_col is None:
+            date_col = idx
+        if low.startswith("использов"):
+            continue  # это не диаметр, а расход
+        if name == "Катанка" or name.startswith("Катанка"):
+            diam_cols[idx] = "Катанка"
+        elif name.startswith("D") and name[1:].strip().isdigit():
+            diam_cols[idx] = "D" + name[1:].strip()
     if not diam_cols:
         return None
+    if date_col is None:
+        date_col = 1  # запасной вариант
 
     result = {}
     for row in rows[1:]:
-        d = row[1] if len(row) > 1 else None
+        d = row[date_col] if len(row) > date_col else None
         if not isinstance(d, _dt):
             continue
         key = (d.year, d.month)
@@ -713,7 +724,7 @@ def build_daily_digest() -> str:
     cur = active[-1]
     cur_tot = sum((sums[c][cur] if cur < len(sums[c]) and sums[c][cur] else 0)
                   for c in sums)
-    lines = [f"☀️ *Доброе утро! Сводка GREEN TASHKENT*",
+    lines = [f"📅 *Месячная сводка GREEN TASHKENT*",
              f"_{datetime.now():%d.%m.%Y}_", "",
              f"Текущий месяц: *{months[cur]}*",
              f"Расходы: *{fmt_num(cur_tot)} сум*", ""]
@@ -1001,15 +1012,23 @@ async def daily_sync_loop():
 
 
 async def daily_digest_loop():
-    """Раз в сутки в DIGEST_HOUR_UTC шлёт утреннюю сводку всем из ALLOWED_USERS."""
+    """1-го числа каждого месяца в DIGEST_HOUR_UTC шлёт сводку всем из ALLOWED_USERS."""
     if not DIGEST_HOUR_UTC or not ALLOWED_USERS:
         return
     hour = int(DIGEST_HOUR_UTC)
     while True:
         now = datetime.utcnow()
-        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
+        # ближайшее 1-е число в нужный час
+        if now.month == 12:
+            target = now.replace(year=now.year + 1, month=1, day=1,
+                                 hour=hour, minute=0, second=0, microsecond=0)
+        else:
+            target = now.replace(month=now.month + 1, day=1,
+                                 hour=hour, minute=0, second=0, microsecond=0)
+        # если сегодня 1-е и время ещё не наступило — шлём сегодня
+        first_today = now.replace(day=1, hour=hour, minute=0, second=0, microsecond=0)
+        if now.day == 1 and now < first_today:
+            target = first_today
         await asyncio.sleep((target - now).total_seconds())
         text = build_daily_digest()
         for uid in ALLOWED_USERS:
@@ -1107,7 +1126,7 @@ async def main():
         print(f"Автообновление включено: каждый день в {SYNC_HOUR_UTC}:00 UTC.")
     if DIGEST_HOUR_UTC and ALLOWED_USERS:
         asyncio.create_task(daily_digest_loop())
-        print(f"Утренняя сводка включена: каждый день в {DIGEST_HOUR_UTC}:00 UTC.")
+        print(f"Месячная сводка включена: 1-го числа в {DIGEST_HOUR_UTC}:00 UTC.")
 
     # Поднимаем веб-сервер (для мини-аппа) параллельно с ботом.
     runner = web.AppRunner(make_web_app())
