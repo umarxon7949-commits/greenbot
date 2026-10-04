@@ -129,35 +129,6 @@ def load_wb():
     return openpyxl.load_workbook(EXCEL_FILE, read_only=True, data_only=True)
 
 
-def recalc_formulas(path: str) -> bool:
-    """Пересчитывает формулы в xlsx через LibreOffice (headless).
-    Возвращает True при успехе. Нужно, т.к. Excel сохраняет устаревший кэш формул."""
-    import subprocess, shutil, glob, tempfile
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        return False
-    outdir = tempfile.mkdtemp()
-    try:
-        # конвертация xlsx->xlsx заставляет LibreOffice пересчитать все формулы
-        subprocess.run(
-            [soffice, "--headless", "--calc", "--convert-to", "xlsx",
-             "--outdir", outdir, path],
-            timeout=180, check=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ, "HOME": tempfile.gettempdir()},
-        )
-        produced = glob.glob(os.path.join(outdir, "*.xlsx"))
-        if not produced:
-            return False
-        shutil.copy(produced[0], path)
-        return True
-    except Exception as e:
-        print(f"[пересчёт] не удалось: {e}")
-        return False
-    finally:
-        shutil.rmtree(outdir, ignore_errors=True)
-
-
 # ──────────────────────────── ОТЧЁТЫ ────────────────────────────
 SKIP_CATS = {"Арматура тоннаж"}  # это объём (тонны), не деньги
 
@@ -964,7 +935,6 @@ async def h_receive_file(message: types.Message, state: FSMContext):
         return
     file = await bot.get_file(doc.file_id)
     await bot.download_file(file.file_path, EXCEL_FILE)
-    recalc_formulas(EXCEL_FILE)  # пересчёт формул (устаревший кэш Excel)
     await message.answer("✅ Таблица обновлена.", reply_markup=main_kb())
 
 
@@ -1022,8 +992,7 @@ def sync_from_url() -> tuple[bool, str]:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(EXCEL_FILE, "wb") as f:
             f.write(data)
-        recalc_formulas(EXCEL_FILE)  # пересчёт формул (устаревший кэш Excel)
-        return True, f"Таблица обновлена из облака ({len(data) // 1024} КБ)."
+            return True, f"Таблица обновлена из облака ({len(data) // 1024} КБ)."
     except Exception as e:
         return False, f"Не удалось скачать: {e}"
 
