@@ -413,11 +413,25 @@ def report_intake(month_key=None) -> str:
     if month_key is None:
         lines = ["🏗 *ПРИХОД АРМАТУРЫ — ВЕСЬ ПЕРИОД*", ""]
         grand = 0.0
+        by_diam = {}
+        lines.append("*По месяцам:*")
         for (y, m) in sorted(data):
             tot = sum(data[(y, m)].values())
             if tot > 0:
                 grand += tot
                 lines.append(f"• {_MONTH_RU[m]} {y}: {fmt_num(round(tot, 2))} т")
+            # копим суммарно по диаметрам
+            for name, t in data[(y, m)].items():
+                by_diam[name] = by_diam.get(name, 0) + t
+        # разбивка по диаметрам за весь период
+        if by_diam:
+            lines.append("")
+            lines.append("*По диаметрам (всего):*")
+            for name, t in sorted(by_diam.items(), key=lambda x: -x[1]):
+                if t <= 0:
+                    continue
+                label = f"Ø {name[1:]}" if name.startswith("D") else name
+                lines.append(f"• {label}: {fmt_num(round(t, 2))} т")
         lines.append("")
         lines.append(f"*ИТОГО приход: {fmt_num(round(grand, 2))} т*")
         return "\n".join(lines)
